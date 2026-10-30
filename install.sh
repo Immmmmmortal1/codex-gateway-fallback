@@ -41,7 +41,14 @@ else
   command -v curl >/dev/null 2>&1 || die "找不到 curl，无法下载安装器"
   # 先探一次，失败就明确报错，避免 curl 静默重试让用户以为命令没反应
   echo "install.sh: 正在下载 $SCRIPT_NAME …"
-  curl -fS --connect-timeout 10 --max-time 90 "$REPO_RAW/$SCRIPT_NAME" -o "$TARGET" || {
+  ok=0
+  for attempt in 1 2 3 4; do
+    if curl -fSL --connect-timeout 8 --max-time 60 \
+         --retry 2 --retry-delay 1 --retry-connrefused \
+         "$REPO_RAW/$SCRIPT_NAME" -o "$TARGET" 2>/dev/null; then ok=1; break; fi
+    [ "$attempt" -lt 4 ] && echo "install.sh: 第 $attempt 次下载失败，重试…"
+  done
+  [ "$ok" = 1 ] || {
     echo "" >&2
     echo "install.sh: 下载失败。" >&2
     if ! curl -s -o /dev/null --connect-timeout 8 --max-time 12 https://raw.githubusercontent.com; then
