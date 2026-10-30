@@ -14,11 +14,10 @@ set -uo pipefail
 REPO_RAW="${CODEX_GF_RAW:-https://raw.githubusercontent.com/Immmmmmortal1/codex-gateway-fallback/main}"
 SCRIPT_NAME="setup_codex_gateway.py"
 
-# curl | bash 时 stdin 是管道，交互式提问会读到脚本剩余文本而不是用户输入。
-# 把 stdin 重新绑到终端；没有终端（CI/管道）就保持原样，由 python 侧判为非交互。
-if [ -r /dev/tty ]; then
-  exec < /dev/tty
-fi
+# 注意：这里绝不能 `exec < /dev/tty`。
+# bash 正在从 stdin（管道）逐行读取本脚本，一旦把 fd0 换成终端，
+# 后续脚本行就会从键盘读，表现为「命令没反应，一直等输入」。
+# 交互式提问由 python 侧显式打开 /dev/tty 解决。
 
 die() {
   echo "install.sh: $*" >&2
@@ -34,12 +33,27 @@ trap cleanup EXIT INT TERM
 TARGET="$TMP_DIR/$SCRIPT_NAME"
 
 # 优先从本地同目录读取（适合 git clone 后直接跑），否则从 GitHub 下载
-if [ -f "$(dirname "$0")/$SCRIPT_NAME" ]; then
-  cp "$(dirname "$0")/$SCRIPT_NAME" "$TARGET"
+LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
+if [ -f "$LOCAL_DIR/$SCRIPT_NAME" ]; then
+  cp "$LOCAL_DIR/$SCRIPT_NAME" "$TARGET"
+  echo "install.sh: 使用本地安装器 $LOCAL_DIR/$SCRIPT_NAME"
 else
   command -v curl >/dev/null 2>&1 || die "找不到 curl，无法下载安装器"
-  curl -fsSL --max-time 60 "$REPO_RAW/$SCRIPT_NAME" -o "$TARGET" \
-    || die "下载 $REPO_RAW/$SCRIPT_NAME 失败（检查网络或仓库是否 public）"
+  # 先探一次，失败就明确报错，避免 curl 静默重试让用户以为命令没反应
+  echo "install.sh: 正在下载 $SCRIPT_NAME …"
+  curl -fS --connect-timeout 10 --max-time 90 "$REPO_RAW/$SCRIPT_NAME" -o "$TARGET" || {
+    echo "" >&2
+    echo "install.sh: 下载失败。" >&2
+    if ! curl -s -o /dev/null --connect-timeout 8 --max-time 12 https://raw.githubusercontent.com; then
+      echo "  看起来 raw.githubusercontent.com 连不上（国内网络常被墙）。" >&2
+      echo "  如果你本机有代理，改成这样重跑：" >&2
+      echo "    export https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897" >&2
+      echo "    curl -fsSL $REPO_RAW/install.sh | bash -s -- --auto" >&2
+    else
+      echo "  能连到 GitHub，但取不到文件。确认仓库是 public、分支是 main。" >&2
+    fi
+    exit 1
+  }
 fi
 
 [ -s "$TARGET" ] || die "安装器为空"
@@ -53,4 +67,6 @@ if "setup_codex_gateway.py" not in src or "def main(" not in src:
     sys.exit("install.sh: 下载到的内容不像安装器，已中止（可能是 404 页面或被篡改）")
 PY
 
-exec python3 "$TARGET" "$@"
+# 不用 exec：exec 会把 bash 进程替换掉，EXIT trap 不再执行，临时目录就泄漏了。
+python3 "$TARGET" "$@"
+exit $?

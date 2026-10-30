@@ -49,6 +49,19 @@ ROLES_DIR = CODEX_HOME / "roles"  # 仅用于清理历史遗留，不再写入
 LEGACY_ROLES_DIR = CODEX_HOME / "agents"
 BIN_DIR = CODEX_HOME / "bin"
 WRAPPER = BIN_DIR / "codex-fb"
+# 安装器自身的稳定副本：curl|bash 时装在临时目录，退出即删，
+# 之后想 --restore 就没路径可用了，所以落一份到 CODEX_HOME/bin。
+INSTALLER_COPY = BIN_DIR / "setup_codex_gateway.py"
+
+
+def installer_hint() -> str:
+    """给用户的回滚命令路径：优先稳定副本，其次当前脚本（本地直跑场景）。"""
+    if INSTALLER_COPY.exists():
+        return INSTALLER_COPY.as_posix()
+    try:
+        return Path(__file__).resolve().as_posix()
+    except NameError:
+        return "setup_codex_gateway.py"
 
 PROFILE_FB1 = "fb"
 PROFILE_FB2 = "fb2"
@@ -74,6 +87,57 @@ def colorize(enabled: bool):
         return f"{color}{text}{C_END}" if enabled else text
 
     return c
+
+
+def tty_available() -> bool:
+    """当前进程能否直接拿到终端。curl | bash 时 stdin 是管道，但 /dev/tty 通常仍可用。"""
+    try:
+        with open("/dev/tty", "r"):
+            return True
+    except OSError:
+        return False
+
+
+def ask(prompt: str) -> str:
+    """从终端读一行。
+
+    不能用内置 input()：curl | bash 场景下 stdin 是脚本内容，
+    input() 会读到脚本剩余文本，表现为静默取到垃圾值。
+    """
+    try:
+        with open("/dev/tty", "r+") as tty:
+            tty.write(prompt)
+            tty.flush()
+            return tty.readline().rstrip("\n")
+    except OSError:
+        return input(prompt)
+
+
+def ask_secret(prompt: str) -> str:
+    """同 ask()，但不回显输入。"""
+    try:
+        with open("/dev/tty", "r+") as tty:
+            tty.write(prompt)
+            tty.flush()
+            try:
+                import termios
+
+                fd = tty.fileno()
+                old = termios.tcgetattr(fd)
+                new = termios.tcgetattr(fd)
+                new[3] &= ~termios.ECHO
+                termios.tcsetattr(fd, termios.TCSADRAIN, new)
+                try:
+                    value = tty.readline().rstrip("\n")
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                    tty.write("\n")
+                    tty.flush()
+                return value
+            except (ImportError, OSError):
+                return tty.readline().rstrip("\n")
+    except OSError:
+        return getpass.getpass(prompt)
 
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -262,7 +326,7 @@ def prompt_choice(
         info(f"直接回车 = 保持当前：{default}")
 
     while True:
-        raw = input(f"{c('选择', C_OK)} [1-{manual_idx}]: ").strip()
+        raw = ask(f"{c('选择', C_OK)} [1-{manual_idx}]: ").strip()
         if not raw:
             if default:
                 return default
@@ -278,7 +342,7 @@ def prompt_choice(
             continue
         n = int(raw)
         if n == manual_idx:
-            name = input("  模型名: ").strip()
+            name = ask("  模型名: ").strip()
             if not name:
                 warn("不能为空")
                 continue
@@ -301,7 +365,7 @@ def prompt_effort(default: str = "medium") -> str:
         mark = c(" ← 当前", C_DIM) if lv == default else ""
         print(f"  {i}. {lv}{mark}")
     while True:
-        raw = input(f"{c('选择', C_OK)} [1-{len(REASONING_LEVELS)}，回车={default}]: ").strip()
+        raw = ask(f"{c('选择', C_OK)} [1-{len(REASONING_LEVELS)}，回车={default}]: ").strip()
         if not raw:
             return default
         if raw.isdigit() and 1 <= int(raw) <= len(REASONING_LEVELS):
@@ -810,11 +874,11 @@ def bootstrap_provider(args) -> dict | None:
     """全新机器：问网关地址与 token，并校验能否拉到模型列表。"""
     head("这台机器上还没有配置模型网关")
     info("需要一个 OpenAI 兼容网关的地址和 token（MemHub 的 token 在 _knowledge/.secrets/api-keys.md）")
-    interactive = sys.stdin.isatty()
+    interactive = sys.stdin.isatty() or tty_available()
     base = args.base_url or os.environ.get("CODEX_BASE_URL")
     if not base:
         if interactive:
-            raw = input(f"  网关地址 [{GATEWAY_DEFAULT}]: ").strip()
+            raw = ask(f"  网关地址 [{GATEWAY_DEFAULT}]: ").strip()
             base = raw or GATEWAY_DEFAULT
         else:
             base = GATEWAY_DEFAULT
@@ -832,7 +896,7 @@ def bootstrap_provider(args) -> dict | None:
             err("非交互环境必须提供 --token 或 CODEX_LB_API_KEY")
             return None
         try:
-            token = getpass.getpass("  网关 token（输入不回显）: ").strip()
+            token = ask_secret("  网关 token（输入不回显）: ").strip()
         except (EOFError, KeyboardInterrupt):
             return None
     if not token:
@@ -1103,6 +1167,16 @@ def main() -> int:
     WRAPPER.chmod(0o755)
     ok(f"{WRAPPER} 已写入")
 
+    # 安装器落一份稳定副本，保证事后 --restore 有可用路径
+    try:
+        me = Path(__file__).resolve()
+        if me != INSTALLER_COPY.resolve():
+            shutil.copy2(me, INSTALLER_COPY)
+            INSTALLER_COPY.chmod(0o644)
+            ok(f"{INSTALLER_COPY} 已写入（回滚用）")
+    except (OSError, NameError, RuntimeError):
+        pass
+
     # 5) 校验
     head("校验")
     all_ok = True
@@ -1148,7 +1222,7 @@ def main() -> int:
     codex -p {PROFILE_FB2} exec "..."        # 用 {fb2}
 
   {c('回滚', C_OK)}
-    python3 {Path(__file__).as_posix()} --restore
+    python3 {installer_hint()} --restore
 """)
     return 0 if all_ok else 3
 
