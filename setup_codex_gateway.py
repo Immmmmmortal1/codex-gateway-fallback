@@ -540,8 +540,14 @@ if [ "${{1:-}}" != "exec" ]; then
 fi
 
 is_retryable() {{
-  grep -qE 'ERROR: (unexpected status (4|5)[0-9]{{2}}|Connection failed|stream|request_build_error)' "$1" 2>/dev/null && return 0
-  grep -qE 'ERROR: Reconnecting\\.\\.\\.' "$1" 2>/dev/null && return 0
+  local log="$1"
+  # 1) 原始 HTTP / 网络错误
+  grep -qE 'unexpected status (4|5)[0-9]{{2}}' "$log" 2>/dev/null && return 0
+  grep -qE 'Connection failed|request_build_error|stream disconnected|Reconnecting\.\.\.' "$log" 2>/dev/null && return 0
+  # 2) 容量 / 限流。这类错误换个模型通常就能过，
+  #    Codex 自己就会提示 "try a different model"，所以必须切。
+  #    注意：这些是 Codex 客户端渲染后的文案，不带 "unexpected status"。
+  grep -qiE 'at capacity|capacity is unavailable|capacity unavailable|too many requests|rate limit|overloaded|quota exceeded' "$log" 2>/dev/null && return 0
   return 1
 }}
 
@@ -591,6 +597,10 @@ for profile in "" "{PROFILE_FB1}" "{PROFILE_FB2}"; do
   if ! is_retryable "$LAST_LOG"; then
     echo "codex-fb: $(label_for "$profile") 失败且不是可重试的 API/网络错误 (exit=${{rc}})，停止 fallback" >&2
     exit "$rc"
+  fi
+  if [ "$profile" = "{PROFILE_FB2}" ]; then
+    echo "codex-fb: $(label_for "$profile") 也失败了 (exit=${{rc}})" >&2
+    break
   fi
   echo "codex-fb: $(label_for "$profile") 失败 (exit=${{rc}})，准备切到下一个模型…" >&2
   sleep 1
