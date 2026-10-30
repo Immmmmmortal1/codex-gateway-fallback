@@ -319,6 +319,18 @@ def current_main_model() -> str | None:
     return m.group(1) if m else None
 
 
+def current_profile_model(profile: str) -> str | None:
+    """读某个 fallback profile 当前用的模型；没有 profile 文件则返回 None。"""
+    p = CODEX_HOME / f"{profile}.config.toml"
+    if not p.exists():
+        return None
+    try:
+        m = re.search(r'^\s*model\s*=\s*"([^"]+)"', p.read_text(encoding="utf-8"), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
 # --------------------------------------------------------------------------- #
 # 交互选择
 # --------------------------------------------------------------------------- #
@@ -543,7 +555,7 @@ is_retryable() {{
   local log="$1"
   # 1) 原始 HTTP / 网络错误
   grep -qE 'unexpected status (4|5)[0-9]{{2}}' "$log" 2>/dev/null && return 0
-  grep -qE 'Connection failed|request_build_error|stream disconnected|Reconnecting\.\.\.' "$log" 2>/dev/null && return 0
+  grep -qE 'Connection failed|request_build_error|stream disconnected|Reconnecting\\.\\.\\.' "$log" 2>/dev/null && return 0
   # 2) 容量 / 限流。这类错误换个模型通常就能过，
   #    Codex 自己就会提示 "try a different model"，所以必须切。
   #    注意：这些是 Codex 客户端渲染后的文案，不带 "unexpected status"。
@@ -1050,14 +1062,26 @@ def main() -> int:
             if not main_model:
                 err("读不到模型列表，无法自动选择")
                 return 1
-        auto_fb = pick_fallbacks(models, main_model, 2)
-        if len(auto_fb) < 2:
-            err(f"网关模型不足，无法为 {main_model} 选出两级 fallback")
-            return 1
-        fb1 = args.fb1 or auto_fb[0]
-        fb2 = args.fb2 or auto_fb[1]
+        # 重新运行安装器的常见诉求是「升级脚本」，不是「改模型」。
+        # 所以已有的 fb1/fb2 一律保留，只在缺失或非法时才自动补，
+        # 显式传 --fb1/--fb2 才覆盖。
+        known = {m["slug"] for m in models}
+        kept1 = current_profile_model(PROFILE_FB1)
+        kept2 = current_profile_model(PROFILE_FB2)
+        fb1 = args.fb1 or (kept1 if kept1 in known and kept1 != main_model else None)
+        fb2 = args.fb2 or (kept2 if kept2 in known and kept2 not in {main_model, fb1} else None)
+        if not fb1 or not fb2:
+            auto_fb = pick_fallbacks(models, main_model, 2)
+            if len(auto_fb) < 2:
+                err(f"网关模型不足，无法为 {main_model} 选出两级 fallback")
+                return 1
+            fb1 = fb1 or auto_fb[0]
+            fb2 = fb2 or next(
+                (x for x in auto_fb if x not in {main_model, fb1}), auto_fb[1]
+            )
         main_effort = args.effort or cur_effort
-        info(f"自动模式：主模型 {main_model} @{main_effort}，一级 {fb1}，二级 {fb2}")
+        kept_note = "（沿用现有选择）" if (args.fb1 is None and args.fb2 is None and kept1 and kept2) else ""
+        info(f"自动模式：主模型 {main_model} @{main_effort}，一级 {fb1}，二级 {fb2}{kept_note}")
     elif args.yes:
         need = {"--main": args.main, "--fb1": args.fb1, "--fb2": args.fb2}
         missing = [k for k, v in need.items() if not v]
