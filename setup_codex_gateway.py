@@ -89,10 +89,14 @@ def colorize(enabled: bool):
     return c
 
 
+def _tty_path() -> str:
+    return "/dev/tty"
+
+
 def tty_available() -> bool:
     """当前进程能否直接拿到终端。curl | bash 时 stdin 是管道，但 /dev/tty 通常仍可用。"""
     try:
-        with open("/dev/tty", "r"):
+        with open(_tty_path(), "r"):
             return True
     except OSError:
         return False
@@ -101,14 +105,20 @@ def tty_available() -> bool:
 def ask(prompt: str) -> str:
     """从终端读一行。
 
-    不能用内置 input()：curl | bash 场景下 stdin 是脚本内容，
-    input() 会读到脚本剩余文本，表现为静默取到垃圾值。
+    不能用内置 input()：curl | bash 场景下 stdin 是脚本剩余内容，input() 会读到垃圾。
+    也不能用 open("/dev/tty", "r+")：/dev/tty 不可 seek，r+ 会抛 UnsupportedOperation，
+    它是 OSError 子类，会被静默吞掉再退回 input()，等于没修。
+    所以写入和读取分别用 "w" / "r" 打开。
     """
     try:
-        with open("/dev/tty", "r+") as tty:
-            tty.write(prompt)
-            tty.flush()
-            return tty.readline().rstrip("\n")
+        with open(_tty_path(), "w") as w:
+            w.write(prompt)
+            w.flush()
+        with open(_tty_path(), "r") as r:
+            line = r.readline()
+        if line == "":
+            raise EOFError
+        return line.rstrip("\r\n")
     except OSError:
         return input(prompt)
 
@@ -116,27 +126,33 @@ def ask(prompt: str) -> str:
 def ask_secret(prompt: str) -> str:
     """同 ask()，但不回显输入。"""
     try:
-        with open("/dev/tty", "r+") as tty:
-            tty.write(prompt)
-            tty.flush()
-            try:
-                import termios
+        import termios
 
-                fd = tty.fileno()
-                old = termios.tcgetattr(fd)
-                new = termios.tcgetattr(fd)
-                new[3] &= ~termios.ECHO
-                termios.tcsetattr(fd, termios.TCSADRAIN, new)
-                try:
-                    value = tty.readline().rstrip("\n")
-                finally:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                    tty.write("\n")
-                    tty.flush()
-                return value
-            except (ImportError, OSError):
-                return tty.readline().rstrip("\n")
-    except OSError:
+        with open(_tty_path(), "w") as w:
+            w.write(prompt)
+            w.flush()
+        fd = os.open(_tty_path(), os.O_RDONLY)
+        try:
+            old = termios.tcgetattr(fd)
+            new = termios.tcgetattr(fd)
+            new[3] &= ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSADRAIN, new)
+            try:
+                chunks = []
+                while True:
+                    b = os.read(fd, 1)
+                    if not b or b in (b"\n", b"\r"):
+                        break
+                    chunks.append(b)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        finally:
+            os.close(fd)
+        with open(_tty_path(), "w") as w:
+            w.write("\n")
+            w.flush()
+        return b"".join(chunks).decode("utf-8", "replace")
+    except (ImportError, OSError):
         return getpass.getpass(prompt)
 
 
