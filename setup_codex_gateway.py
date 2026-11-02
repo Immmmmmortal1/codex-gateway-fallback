@@ -1333,6 +1333,12 @@ def main() -> int:
                 )
                 return 0
             info(f"开始从 {local} 更新到 {remote}")
+        # --update 的语义是「原地更新」：保留现有主模型与两级 fallback，
+        # 不要掉进交互提问（在 curl|bash 下会卡住等输入）。
+        # 想重新挑模型就直接跑不带参数的安装命令。
+        if not (args.main or args.fb1 or args.fb2):
+            args.auto = True
+            info("按原地更新处理：保留现有主模型与两级 fallback")
         print()
 
     head("环境")
