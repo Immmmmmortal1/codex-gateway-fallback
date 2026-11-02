@@ -75,6 +75,9 @@ export https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897
 python3 ~/.codex/bin/setup_codex_gateway.py --check-update
 ```
 
+> 刚发新版后的几分钟内，`raw.githubusercontent.com` 的 CDN 可能还返回旧内容，
+> 这时 `--update` 会说「已是最新」。等几分钟再试即可。
+
 **不要**用 `~/.codex/bin/setup_codex_gateway.py --update`：那是本地副本，本身就是要更新掉的旧版，用它更新等于把旧版再装一遍。脚本检测到这种情况会拦住并提示正确的 curl 命令。
 
 重跑安装是安全的：安装前自动备份到 `~/.codex/backups/codex-config-*`。`--auto` 重跑时**沿用现有的 fb1/fb2**（只在模型缺失或已从网关下线时才重新挑），不会把你自己选的模型悄悄换掉。
