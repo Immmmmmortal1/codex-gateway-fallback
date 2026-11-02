@@ -85,6 +85,16 @@ fi
 
 [ -s "$TARGET" ] || die "安装器为空"
 
+# 版本号以仓库里的 VERSION 为唯一真相源；取不到就让脚本用自带兜底值
+if [ -z "${CODEX_GF_VERSION:-}" ]; then
+  VER_TMP="$TMP_DIR/VERSION"
+  if curl -fSL --connect-timeout 8 --max-time 30 --retry 2 \
+       "$REPO_RAW/VERSION" -o "$VER_TMP" 2>/dev/null && [ -s "$VER_TMP" ]; then
+    CODEX_GF_VERSION="$(tr -d '[:space:]' < "$VER_TMP")"
+    export CODEX_GF_VERSION
+  fi
+fi
+
 python3 - "$TARGET" <<'PY' || exit 1
 import sys
 

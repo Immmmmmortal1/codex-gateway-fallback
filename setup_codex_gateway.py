@@ -56,7 +56,30 @@ INSTALLER_COPY = BIN_DIR / "setup_codex_gateway.py"
 VERSION_FILE = BIN_DIR / ".codex-gf-version"
 # 首次安装前的原始状态：只写一次，永不覆盖，--uninstall 靠它还原
 FIRST_INSTALL_DIR = CODEX_HOME / "backups" / "codex-config-first-install"
-SKILL_VERSION = "1.1.5"
+# 版本单一真相源是仓库根目录的 VERSION 文件；常量只在拿不到文件时兜底。
+# 两者不一致会让版本文件记错误的值，--check-update 之后永远判断为「有新版」。
+_FALLBACK_VERSION = "1.1.7"
+
+
+def _resolve_version() -> str:
+    # 1) install.sh 下载时注入（curl|bash 场景，脚本单独躺临时目录）
+    env_v = os.environ.get("CODEX_GF_VERSION", "").strip()
+    if env_v:
+        return env_v
+    # 2) 旁边的 VERSION：bin/VERSION（已安装）或仓库根（开发场景）
+    here = Path(__file__).resolve().parent
+    for cand in (here / "VERSION", here.parent / "VERSION"):
+        try:
+            v = cand.read_text(encoding="utf-8").strip()
+            if v:
+                return v
+        except OSError:
+            continue
+    # 3) 兜底常量（理论上不该走到这里）
+    return _FALLBACK_VERSION
+
+
+SKILL_VERSION = _resolve_version()
 REPO_RAW_HINT = "https://raw.githubusercontent.com/Immmmmmortal1/codex-gateway-fallback/main"
 UPSTREAM_VERSION_URL = (
     "https://raw.githubusercontent.com/Immmmmmortal1/codex-gateway-fallback/main/VERSION"
@@ -871,6 +894,7 @@ def do_uninstall(keep_model: bool, assume_yes: bool) -> int:
         WRAPPER,
         INSTALLER_COPY,
         VERSION_FILE,
+        BIN_DIR / "VERSION",
     ]
     present = [p for p in targets if p.exists()]
     if not present and not CONFIG.exists():
@@ -1574,6 +1598,8 @@ def main() -> int:
     # 记录版本，供 --check-update / --update 比对
     try:
         VERSION_FILE.write_text(SKILL_VERSION + "\n", encoding="utf-8")
+        # 同时落一份 VERSION，让后续从 bin/ 直接运行时也能解析到正确版本
+        (BIN_DIR / "VERSION").write_text(SKILL_VERSION + "\n", encoding="utf-8")
     except OSError:
         pass
 
