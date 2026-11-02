@@ -727,7 +727,27 @@ def snapshot_first_install() -> None:
     if FIRST_INSTALL_DIR.exists():
         return
     FIRST_INSTALL_DIR.mkdir(parents=True, exist_ok=False)
-    if CONFIG.exists():
+
+    # 关键：如果这是「装过旧版本、现在升级」的机器，当前 config.toml 已经是
+    # 被改过的状态，直接快照它会永久丢掉原始配置。此时优先取历史 pre-install
+    # 备份里最早、且不含 fb 文件的那份（那时还没装过 fallback）。
+    clean_src = None
+    root = CODEX_HOME / "backups"
+    if root.is_dir():
+        for d in sorted(
+            (x for x in root.iterdir()
+             if x.is_dir() and x.name.startswith("codex-config-pre-install-")),
+            key=lambda x: x.name,
+        ):
+            has_fb = (d / f"{PROFILE_FB1}.config.toml").exists() or (d / "codex-fb").exists()
+            if not has_fb and (d / "config.toml").exists():
+                clean_src = d / "config.toml"
+                break
+
+    if clean_src is not None:
+        shutil.copy2(clean_src, FIRST_INSTALL_DIR / "config.toml")
+        info(f"原始配置取自历史备份 {clean_src.parent.name}")
+    elif CONFIG.exists():
         shutil.copy2(CONFIG, FIRST_INSTALL_DIR / "config.toml")
     for name in (f"{PROFILE_FB1}.config.toml", f"{PROFILE_FB2}.config.toml"):
         p = CODEX_HOME / name
