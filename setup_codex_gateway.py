@@ -58,7 +58,7 @@ VERSION_FILE = BIN_DIR / ".codex-gf-version"
 FIRST_INSTALL_DIR = CODEX_HOME / "backups" / "codex-config-first-install"
 # 版本单一真相源是仓库根目录的 VERSION 文件；常量只在拿不到文件时兜底。
 # 两者不一致会让版本文件记错误的值，--check-update 之后永远判断为「有新版」。
-_FALLBACK_VERSION = "1.1.7"
+_FALLBACK_VERSION = "1.1.8"
 
 
 def _resolve_version() -> str:
