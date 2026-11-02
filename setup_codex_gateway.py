@@ -52,6 +52,15 @@ WRAPPER = BIN_DIR / "codex-fb"
 # 安装器自身的稳定副本：curl|bash 时装在临时目录，退出即删，
 # 之后想 --restore 就没路径可用了，所以落一份到 CODEX_HOME/bin。
 INSTALLER_COPY = BIN_DIR / "setup_codex_gateway.py"
+# 版本记录：--check-update / --update 靠它判断本地装的是哪一版
+VERSION_FILE = BIN_DIR / ".codex-gf-version"
+# 首次安装前的原始状态：只写一次，永不覆盖，--uninstall 靠它还原
+FIRST_INSTALL_DIR = CODEX_HOME / "backups" / "codex-config-first-install"
+SKILL_VERSION = "1.1.5"
+REPO_RAW_HINT = "https://raw.githubusercontent.com/Immmmmmortal1/codex-gateway-fallback/main"
+UPSTREAM_VERSION_URL = (
+    "https://raw.githubusercontent.com/Immmmmmortal1/codex-gateway-fallback/main/VERSION"
+)
 
 
 def installer_hint() -> str:
@@ -662,6 +671,264 @@ def latest_backup() -> Path | None:
     return dirs[-1] if dirs else None
 
 
+def installed_version() -> str:
+    try:
+        return VERSION_FILE.read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _ver_tuple(v: str) -> tuple:
+    parts = []
+    for piece in v.strip().lstrip("v").split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts) or (0,)
+
+
+def fetch_upstream_version(timeout: int = 12) -> str | None:
+    """读 GitHub 上的 VERSION。取不到就返回 None，不抛异常。"""
+    try:
+        with urllib.request.urlopen(UPSTREAM_VERSION_URL, timeout=timeout) as r:
+            text = r.read().decode("utf-8", "replace").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def check_update(quiet: bool = False) -> tuple[str, str | None, bool]:
+    """返回 (本地版本, 远端版本或 None, 是否有新版)。"""
+    local = installed_version()
+    remote = fetch_upstream_version()
+    newer = bool(remote) and _ver_tuple(remote) > _ver_tuple(local)
+    if not quiet:
+        print(f"  本地已装：{local}")
+        if remote is None:
+            warn("读不到远端版本（网络不通，或仓库改名）")
+        else:
+            print(f"  远端最新：{remote}")
+            if newer:
+                print("  有新版可用。")
+            elif _ver_tuple(remote) == _ver_tuple(local):
+                ok("已是最新")
+            else:
+                print("  本地版本比远端还新（可能是本地预览版）")
+    return local, remote, newer
+
+
+def snapshot_first_install() -> None:
+    """把「安装前」的原始状态存一份永久副本，只写一次，永不覆盖。
+
+    每次安装都会 backup("pre-install")，那批目录会被后续安装逐步挤掉，
+    所以卸载若只依赖最近的 pre-install，就还原不到真正的初始状态。
+    """
+    if FIRST_INSTALL_DIR.exists():
+        return
+    FIRST_INSTALL_DIR.mkdir(parents=True, exist_ok=False)
+    if CONFIG.exists():
+        shutil.copy2(CONFIG, FIRST_INSTALL_DIR / "config.toml")
+    for name in (f"{PROFILE_FB1}.config.toml", f"{PROFILE_FB2}.config.toml"):
+        p = CODEX_HOME / name
+        if p.exists():
+            shutil.copy2(p, FIRST_INSTALL_DIR / name)
+    if WRAPPER.exists():
+        shutil.copy2(WRAPPER, FIRST_INSTALL_DIR / "codex-fb")
+    (FIRST_INSTALL_DIR / "MANIFEST.txt").write_text(
+        f"tag=first-install\ncreated={time.ctime()}\n", encoding="utf-8"
+    )
+
+
+def find_clean_config_backup() -> Path | None:
+    """找一份「安装器动过之前」的 config.toml。
+
+    优先 first-install；否则在历史 pre-install 里找最早的那份
+    （最早的 pre-install 里不会有 fb 文件，说明那时还没装过 fallback）。
+    """
+    if (FIRST_INSTALL_DIR / "config.toml").exists():
+        return FIRST_INSTALL_DIR / "config.toml"
+    root = CODEX_HOME / "backups"
+    if not root.is_dir():
+        return None
+    candidates = sorted(
+        (d for d in root.iterdir() if d.is_dir() and d.name.startswith("codex-config-pre-install-")),
+        key=lambda d: d.name,
+    )
+    for d in candidates:
+        if (d / "config.toml").exists():
+            return d / "config.toml"
+    return None
+
+
+def original_model_from_backup() -> str | None:
+    p = find_clean_config_backup()
+    if not p:
+        return None
+    try:
+        m = re.search(r'^\s*model\s*=\s*"([^"]+)"', p.read_text(encoding="utf-8"), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def original_table_names() -> set[str] | None:
+    """安装前 config.toml 里已存在的 table 名（如 model_providers.codex-lb）。"""
+    p = find_clean_config_backup()
+    if not p:
+        return None
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    out = set()
+    for line in lines:
+        m = TABLE_RE.match(line)
+        if m:
+            out.add(m.group(1).strip())
+    return out
+
+
+def drop_provider_tables(lines: list[str], providers: set[str]) -> list[str]:
+    """删掉指定 model_providers.* 的整段（含其下的键值行和注释）。
+
+    只动 model_providers.<name>，不碰 [projects.*] 等用户自己的段。
+    """
+    if not providers:
+        return lines
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        m = TABLE_RE.match(line)
+        if m:
+            name = m.group(1).strip()
+            skipping = name in providers
+            if skipping:
+                # 顺带吃掉紧邻前面的注释 / 空行
+                while out and (not out[-1].strip() or out[-1].lstrip().startswith("#")):
+                    out.pop()
+                continue
+        if skipping:
+            continue
+        out.append(line)
+    return out
+
+
+def original_top_block() -> list[str] | None:
+    """取安装前 config.toml 里第一个 [table] 之前的那段（全局键）。
+
+    卸载要还的不只 model：安装器还会补 model_reasoning_effort、
+    model_provider，这些在原文件里可能压根没有，必须整段还原。
+    """
+    p = find_clean_config_backup()
+    if not p:
+        return None
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    out = []
+    for line in lines:
+        if TABLE_RE.match(line):
+            break
+        out.append(line)
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
+def do_uninstall(keep_model: bool, assume_yes: bool) -> int:
+    """移除 fallback 机制，把 Codex 还原到安装本工具之前的样子。
+
+    只删本工具自己造的东西：
+      受管注释头、fb/fb2 profile、codex-fb wrapper、安装器副本、版本文件。
+    网关 provider 段**不删** —— 旧版安装器可能写过它，但它现在也承载用户
+    自己的网关配置，删掉会让 Codex 直接连不上模型。
+    """
+    targets = [
+        CODEX_HOME / f"{PROFILE_FB1}.config.toml",
+        CODEX_HOME / f"{PROFILE_FB2}.config.toml",
+        WRAPPER,
+        INSTALLER_COPY,
+        VERSION_FILE,
+    ]
+    present = [p for p in targets if p.exists()]
+    if not present and not CONFIG.exists():
+        info("没有可卸载的内容（相关文件都不存在）")
+        return 0
+
+    orig_model = original_model_from_backup()
+    head("将要删除")
+    for p in present:
+        print(f"  - {p}")
+    if CONFIG.exists():
+        if keep_model or not orig_model:
+            print(f"  ~ {CONFIG}：只移除受管注释头，model 保持当前值")
+        else:
+            print(f"  ~ {CONFIG}：model 还原为 {orig_model}")
+    print("  · 网关 provider 段与 token 保持不动（可能属于你原有配置）")
+
+    if not assume_yes:
+        ans = ask(f"\n确认卸载？输入 yes 继续: ").strip().lower()
+        if ans != "yes":
+            info("已取消，未做任何修改")
+            return 0
+
+    bk = backup("pre-uninstall")
+    ok(f"卸载前已备份到 {bk}")
+
+    for p in present:
+        try:
+            p.unlink()
+            ok(f"{p} 已删除")
+        except OSError as e:
+            warn(f"{p} 删除失败：{e}")
+
+    if CONFIG.exists():
+        lines = read_lines()
+        top = original_top_block()
+        if top is not None and not keep_model:
+            # 找到当前文件第一个 table，把它之前的全局段整体换回原样
+            cut = first_table_index(lines)
+            rest = lines[cut:]
+            while rest and not rest[0].strip():
+                rest.pop(0)
+            # 安装器新建的 provider 段要删掉；原有的 provider 一律保留
+            orig_tables = original_table_names()
+            created = set()
+            if orig_tables is not None:
+                for line in rest:
+                    m = TABLE_RE.match(line)
+                    if m:
+                        name = m.group(1).strip()
+                        if name.startswith("model_providers.") and name not in orig_tables:
+                            created.add(name)
+            if created:
+                rest = drop_provider_tables(rest, created)
+                info("已删除安装器新建的 provider 段：" + ", ".join(sorted(created)))
+            rebuilt = list(top)
+            if rest:
+                rebuilt.append("")
+                rebuilt.extend(rest)
+            CONFIG.write_text("\n".join(rebuilt).rstrip() + "\n", encoding="utf-8")
+            CONFIG.chmod(0o600)
+            keys = ", ".join(
+                l.split("=", 1)[0].strip() for l in top if "=" in l
+            ) or "（无全局键）"
+            ok(f"config.toml 顶部已还原为安装前的值：{keys}")
+        else:
+            lines = [l for l in lines if l.strip() not in MANAGED_HEADERS]
+            CONFIG.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+            CONFIG.chmod(0o600)
+            ok("config.toml 的受管注释头已移除（model 保持当前值）")
+
+    head("完成")
+    print("  Codex 的 fallback 机制已移除。重启 Codex 生效。")
+    if bk:
+        print(f"  想反悔：把 {bk.as_posix()} 里的文件拷回去即可")
+    return 0
+
+
 def do_restore() -> int:
     src = latest_backup()
     if not src:
@@ -985,6 +1252,14 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只打印将要写入的内容")
     ap.add_argument("--fix-legacy", action="store_true", help="清理本版本已废弃字段")
     ap.add_argument("--no-probe", action="store_true", help="跳到档位探测，直接用声明的 effort（可能被网关拒绝）")
+    ap.add_argument("--uninstall", action="store_true", help="卸载 fallback 机制，还原 Codex 原配置")
+    ap.add_argument(
+        "--keep-model",
+        action="store_true",
+        help="配合 --uninstall：config.toml 的 model 保持当前值，不还原为安装前的值",
+    )
+    ap.add_argument("--check-update", action="store_true", help="只检查是否有新版本，不写入任何文件")
+    ap.add_argument("--update", action="store_true", help="更新到最新版本（已是最新则直接退出）")
     ap.add_argument("--restore", action="store_true", help="回滚最近一次安装")
     ap.add_argument("--yes", action="store_true", help="非交互，必须配合 --main / --fb1 / --fb2")
     ap.add_argument("--auto", action="store_true", help="零交互：用现有主模型，自动挑两级 fallback")
@@ -1001,6 +1276,44 @@ def main() -> int:
 
     if args.restore:
         return do_restore()
+
+    if args.check_update:
+        head("版本")
+        check_update()
+        print(f"\n  更新：{Path(sys.argv[0]).name} --update")
+        return 0
+
+    if args.uninstall:
+        head("卸载")
+        return do_uninstall(keep_model=args.keep_model, assume_yes=args.yes)
+
+    if args.update:
+        head("版本")
+        local, remote, newer = check_update()
+        if remote is None:
+            warn("读不到远端版本，无法判断是否有更新。")
+            print("  如果只是想重装当前版本，去掉 --update 直接跑安装命令即可。")
+            return 1
+        elif not newer:
+            ok("已是最新，无需更新")
+            return 0
+        else:
+            # 关键：本地副本自己就是旧版，用它 --update 只会把旧版再装一遍。
+            # 只有「刚从 GitHub 下载的新脚本」才允许继续执行安装。
+            self_is_local_copy = False
+            try:
+                self_is_local_copy = Path(__file__).resolve() == INSTALLER_COPY.resolve()
+            except (OSError, NameError):
+                pass
+            if self_is_local_copy:
+                info(f"有新版本 {remote}，但当前脚本是本地副本（{local}），无法自我更新。")
+                print("  请运行：")
+                print(
+                    f"    curl -fsSL {REPO_RAW_HINT}/install.sh | bash -s -- --update"
+                )
+                return 0
+            info(f"开始从 {local} 更新到 {remote}")
+        print()
 
     head("环境")
     info(f"CODEX_HOME = {CODEX_HOME}")
@@ -1169,6 +1482,11 @@ def main() -> int:
         print(fb2_file)
         return 0
 
+    # 首次安装前先存一份永久快照，--uninstall 要还原到它
+    snapshot_first_install()
+    if FIRST_INSTALL_DIR.exists():
+        info(f"首次安装前状态已留存：{FIRST_INSTALL_DIR}")
+
     bk = backup("pre-install")
     ok(f"已备份到 {bk}")
 
@@ -1225,6 +1543,12 @@ def main() -> int:
             INSTALLER_COPY.chmod(0o644)
             ok(f"{INSTALLER_COPY} 已写入（回滚用）")
     except (OSError, NameError, RuntimeError):
+        pass
+
+    # 记录版本，供 --check-update / --update 比对
+    try:
+        VERSION_FILE.write_text(SKILL_VERSION + "\n", encoding="utf-8")
+    except OSError:
         pass
 
     # 5) 校验

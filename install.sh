@@ -32,6 +32,26 @@ trap cleanup EXIT INT TERM
 
 TARGET="$TMP_DIR/$SCRIPT_NAME"
 
+# 卸载 / 版本检查 / 回滚这类操作必须离线可用：优先用本机已有的安装器副本。
+# 否则用户想卸载时一旦连不上 GitHub，就永远卸不掉了。
+LOCAL_COPY="${CODEX_HOME:-$HOME/.codex}/bin/$SCRIPT_NAME"
+NEED_LOCAL=""
+for a in "$@"; do
+  case "$a" in
+    --uninstall|--restore|--check-update) NEED_LOCAL=1 ;;
+  esac
+done
+
+if [ -n "$NEED_LOCAL" ]; then
+  if [ -f "$LOCAL_COPY" ]; then
+    exec python3 "$LOCAL_COPY" "$@"
+  fi
+  echo "install.sh: 这台机器上没有安装器副本：${LOCAL_COPY}" >&2
+  echo "            说明本机没有用本工具装过，通常无需卸载。" >&2
+  echo "            若确实装过但副本丢了，可先跑一次安装命令重建，再执行卸载。" >&2
+  exit 1
+fi
+
 # 优先从本地同目录读取（适合 git clone 后直接跑），否则从 GitHub 下载
 LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
 if [ -f "$LOCAL_DIR/$SCRIPT_NAME" ]; then
