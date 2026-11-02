@@ -1,4 +1,0 @@
-interface:
-  display_name: "Codex Gateway Fallback"
-  short_description: "给 Codex 接入自建 OpenAI 兼容网关，配置主模型加两级 fallback，报错自动切换"
-  default_prompt: "用 $codex-gateway-fallback 帮我把 Codex 接上我的网关并配好 fallback"
